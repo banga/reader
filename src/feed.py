@@ -1,130 +1,77 @@
-from tables import engine, feed_urls, feed_items
-from sqlalchemy import insert, select, and_
-from datetime import datetime
-from time import mktime
-import hashlib
-import feedparser
+""" Feed.py
 
-def to_datetime(t):
-    return datetime.fromtimestamp(mktime(t))
+    Methods that deal with fetching, reading and writing feeds
+"""
+from tables import feeds, stories, with_connection, on_duplicate_update
+from sqlalchemy import select, and_
+from fetcher import update_feed
 
-def update_feed(url):
-    """ Updates the feed if it has been modified since it was last updated
+
+@with_connection
+def get_feed_list(connection):
+    return connection.execute(select([feeds])).fetchall()
+
+
+@with_connection
+def get_all_stories(page=1, page_size=25, connection=None):
+    s = select([stories, feeds], from_obj=[stories.join(feeds)]) \
+        .order_by(stories.c.published.desc()).apply_labels() \
+        .limit(page_size).offset((page-1)*page_size)
+    return connection.execute(s).fetchall()
+
+
+@with_connection
+def get_feed(url, connection):
+    """ Loads a feed's metadata
+    """
+    return connection.execute(select([feeds], feeds.c.url == url)).fetchone()
+
+
+@with_connection
+def get_feed_stories(feed_id, connection):
+    """ Loads the stories stored for a feed
+    """
+    s = select([stories], stories.c.feed_id == feed_id) \
+          .order_by(stories.c.published.desc())
+    return connection.execute(s).fetchall()
+
+
+@with_connection
+def write_feed(row, stories, connection):
+    """ Update the feed if it has been modified since it was last updated
         or if it's a new feed
     """
-    now = datetime.now()
-    d = feedparser.parse(url)
-    if 'title' not in d.feed:
-        print '{0} is probably not a feed'.format(url)
-        return None
+    s = select([feeds], feeds.c.url == row['url'])
+    old_row = connection.execute(s).fetchone()
 
-    if d.feed.get('modified_parsed'):
-        feed_updated = to_datetime(d.feed.modified_parsed)
-    elif d.feed.get('updated_parsed'):
-        feed_updated = to_datetime(d.feed.updated_parsed)
-    else:
-        feed_updated = now
+    if old_row is None:
+        connection.execute(feeds.insert(), **row)
+        old_row = connection.execute(s).fetchone()
 
-    conn = engine.connect()
-    s = select([feed_urls], feed_urls.c.url == url)
-    row = conn.execute(s).fetchone()
+    if old_row.fetched < row['updated']:
+        print 'Updating feed ' + row['url']
 
-    if row == None:
-        conn.execute(feed_urls.insert(), url=url, title=d.feed.title)
-        row = conn.execute(s).fetchone()
+        for story in stories.itervalues():
+            story['feed_id'] = old_row.id
+            write_story(story, connection)
 
-    if row.updated < feed_updated:
-        print 'Updating feed ' + url
-        for entry in d.entries:
-            add_feed_entry(row.id, entry, conn, now)
-        u = feed_urls.update().where(feed_urls.c.id==row.id) \
-                .values(title=d.feed.title, updated=now)
-        conn.execute(u)
-    conn.close()
-    return row
+        u = feeds.update().where(feeds.c.id == old_row.id).values(**row)
+        connection.execute(u)
+        return True
 
-def get_unique_id(entry, values):
-    if 'guid' in entry:
-        contents = entry['guid']
-    elif 'id' in entry:
-        contents = entry['id']
-    elif 'contents' in values:
-        contents = values['contents']
-    elif 'summary' in values:
-        contents = values['summary']
-    md5 = hashlib.md5()
-    md5.update(contents)
-    return md5.hexdigest()
+    return False
 
-def add_feed_entry(feed_id, entry, conn, now):
-    # Populate entry values
-    values = { 'updated': now }
 
-    for field in ['author', 'link', 'title']:
-        if entry.get(field):
-            values[field] = entry.get(field)
+def write_story(story, connection):
+    on_duplicate_update(
+        connection,
+        stories,
+        and_(stories.c.feed_id == story['feed_id'],
+             stories.c.uid == story['uid']),
+        story)
 
-    if entry.get('published_parsed'):
-        values['published'] = to_datetime(entry.published_parsed)
 
-    if 'summary' in entry:
-        values['summary'] = entry.summary
-    elif 'description' in entry:
-        values['summary'] = entry.description
-
-    if 'content' in entry:
-        values['contents'] = ''
-        for content in entry.content:
-            values['contents'] += content.value
-
-    uid = get_unique_id(entry, values)
-
-    # Update if already exists
-    equal = and_(feed_items.c.feed_id==feed_id, feed_items.c.uid==uid)
-    s = select([feed_items], equal)
-    row = conn.execute(s).fetchone()
-    if row:
-        item_updated = now
-        if entry.get('updated_parsed'):
-            item_updated = to_datetime(entry.updated_parsed)
-        elif entry.get('published_parsed'):
-            item_updated = to_datetime(entry.published_parsed)
-
-        if item_updated > row.updated:
-            print '\n\nITEM UPDATED at {0} LAST VISITED at {1}' .format(item_updated, row.updated)
-            u = feed_items.update().where(equal)
-            conn.execute(u.values(values))
-    else:
-        conn.execute(feed_items.insert(), feed_id=feed_id, uid=uid, **values)
-
-def get_feed(url):
-    row = update_feed(url)
-    if not row:
-        return None
-
-    conn = engine.connect()
-    feed = {'feed': row}
-    s = select([feed_items], feed_items.c.feed_id == row.id) \
-            .order_by(feed_items.c.published.desc())
-    feed['items'] = conn.execute(s).fetchall()
-    conn.close()
-
-    return feed
-
-def get_feed_list():
-    conn = engine.connect()
-    rows = conn.execute(select([feed_urls])).fetchall()
-    conn.close()
-    return rows
-
-def get_all_items():
-    conn = engine.connect()
-    s = select([feed_items]).order_by(feed_items.c.published.desc())
-    items = conn.execute(s).fetchall()
-    conn.close()
-    return items
-
-if __name__ == "__main__":
+def main():
     import sys
 
     if len(sys.argv) < 3:
@@ -134,15 +81,23 @@ if __name__ == "__main__":
     action = sys.argv[1]
     urls = sys.argv[2:]
     if action == 'update':
+        urls_updated = 0
         for url in urls:
-            update_feed(url)
+            feed = get_feed(url)
+            updated_feed = update_feed(url, feed)
+            if updated_feed and write_feed(*updated_feed):
+                urls_updated += 1
+        print '{0} feeds updated'.format(urls_updated)
     elif action == 'get':
         for url in urls:
-            items = get_feed_items(url)
+            feed = get_feed(url)
             print '==='
             print url
             print '==='
-            for item in items:
-                print '\t', item.title, item.summary, item.uid
+            for story in get_feed_stories(feed.id):
+                print '\t', story.title, story.summary, story.uid
                 print '---'
 
+
+if __name__ == "__main__":
+    main()
